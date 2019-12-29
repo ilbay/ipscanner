@@ -42,10 +42,15 @@ static int raw_socket_id = -1;
 static uint8_t src_mac[6];
 static uint8_t src_ip[4];
 static uint8_t src_netmask[4];
+static uint8_t base_addr[4];
+static uint32_t ip_counter = 0;
+static uint32_t ip_counter_mask = 0;
+
 static struct sockaddr_ll src_device;
 static struct arp_hdr arphdr;
 static unsigned int inf_index = 0;
 static uint8_t *ether_frame = NULL;
+static int arp_recv_interrupted = 0;
 
 int arp_send_init(const char *interface)
 {
@@ -82,6 +87,16 @@ int arp_send_init(const char *interface)
     }
     ipaddr = (struct sockaddr_in*)&ifr.ifr_netmask;
     memcpy(src_netmask, &ipaddr->sin_addr, 4 * sizeof(uint8_t));
+
+    printf("%u.%u.%u.%u\t%u.%u.%u.%u\n", src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_netmask[0], src_netmask[1], src_netmask[2], src_netmask[3]);
+
+    int i = 0;
+    for (i = 0; i < 4; i++) {
+        base_addr[i] = src_ip[i] & src_netmask[i];
+        ip_counter_mask <<= 8;
+        ip_counter_mask |= (uint8_t)(~src_netmask[i] & 0xFF);
+    }
+    printf("%x\n", ip_counter_mask);
 
     memset (&src_device, 0, sizeof(src_device));
     src_device.sll_ifindex = (int)inf_index;
@@ -136,6 +151,7 @@ void arp_send_close()
         close(raw_socket_id);
         raw_socket_id = -1;
     }
+    arp_recv_interrupted = 1;
 }
 
 int arp_send_to(uint32_t target_ip)
@@ -152,5 +168,48 @@ int arp_send_to(uint32_t target_ip)
         perror ("arp_send_to failed");
         return -1;
     }
+    return 0;
+}
+
+void* arp_recv(void *arg)
+{
+    #define ARPOP_REPLY 2
+    uint8_t *recv_ether_frame = (uint8_t*)calloc(IP_MAXPACKET, 1);
+    struct arp_hdr *recv_arphdr = (struct arp_hdr *) (recv_ether_frame + 6 + 6 + 2);
+
+    while ( arp_recv_interrupted == 0) {
+        if ((recv (raw_socket_id, recv_ether_frame, IP_MAXPACKET, 0)) < 0) {
+            if (errno == EINTR) {
+                memset (recv_ether_frame, 0, IP_MAXPACKET * sizeof (uint8_t));
+                continue;  // Something weird happened, but let's try again.
+            } else {
+                perror ("recv() failed:");
+                return NULL;
+            }
+        }
+
+        if( (((recv_ether_frame[12] << 8) + recv_ether_frame[13]) != ETH_P_ARP) || (ntohs (recv_arphdr->opcode) != ARPOP_REPLY) ) {
+            continue;
+        }
+
+        printf("%x:%x:%x:%x:%x:%x\t", recv_ether_frame[6], recv_ether_frame[7], recv_ether_frame[8], recv_ether_frame[9], recv_ether_frame[10], recv_ether_frame[11]);
+        printf("%u.%u.%u.%u\n", recv_arphdr->sender_ip[0], recv_arphdr->sender_ip[1], recv_arphdr->sender_ip[2], recv_arphdr->sender_ip[3]);
+    }
+    return NULL;
+}
+
+int calc_next_dest_ip(uint8_t dest_ip[4]) {
+    ip_counter++;
+    if(ip_counter >= ip_counter_mask)
+    {
+        ip_counter = 0;
+        return -1;
+    }
+
+    memcpy(dest_ip, base_addr, 4);
+    int i = 0;
+    for (i = 0; i < 4; i++)
+        dest_ip[3-i] |= (ip_counter << (i*8)) & 0xFF;
+
     return 0;
 }
